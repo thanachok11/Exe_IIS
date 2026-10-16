@@ -2,12 +2,27 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
 
 namespace IisKeepAlive
 {
+    public class AppConfig
+    {
+        public SettingsConfig Settings { get; set; } = new();
+    }
+
+    public class SettingsConfig
+    {
+        public List<string> Urls { get; set; } = new() { "http://localhost" };
+        public int IntervalMinutes { get; set; } = 60;
+        public int TimeoutSeconds { get; set; } = 30;
+        public bool RunOnce { get; set; } = false;
+        public bool IgnoreSslErrors { get; set; } = true;
+        public bool LogToFile { get; set; } = true;
+    }
+
     internal class Program
     {
         private static HttpClient? _httpClient;
@@ -18,77 +33,88 @@ namespace IisKeepAlive
         {
             Console.Title = "IIS Keep-Alive Service";
 
-            // 1. Build configuration
-            var config = new ConfigurationBuilder()
-                .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
-                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                .Build();
+            // 1. Load config from appsettings.json using built-in System.Text.Json
+            var settings = new SettingsConfig();
+            string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
 
-            var urls = new List<string>();
-            config.GetSection("Settings:Urls").Bind(urls);
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    string json = await File.ReadAllTextAsync(configPath);
+                    var loaded = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
 
-            // Command line arguments override
+                    if (loaded?.Settings != null)
+                    {
+                        settings = loaded.Settings;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"[WARN] Could not parse appsettings.json: {ex.Message}. Using default settings.");
+                }
+            }
+
+            // CLI arguments override
             if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
-                urls.Clear();
-                urls.Add(args[0]);
+                settings.Urls = new List<string> { args[0] };
             }
 
-            if (urls.Count == 0)
-            {
-                urls.Add("http://localhost");
-            }
-
-            int intervalMinutes = config.GetValue("Settings:IntervalMinutes", 60);
             if (args.Length > 1 && int.TryParse(args[1], out int argInterval))
             {
-                intervalMinutes = argInterval;
+                settings.IntervalMinutes = argInterval;
             }
 
-            int timeoutSeconds = config.GetValue("Settings:TimeoutSeconds", 30);
-            bool runOnce = config.GetValue("Settings:RunOnce", false);
-            bool ignoreSsl = config.GetValue("Settings:IgnoreSslErrors", true);
-            _logToFile = config.GetValue("Settings:LogToFile", true);
+            if (settings.Urls == null || settings.Urls.Count == 0)
+            {
+                settings.Urls = new List<string> { "http://localhost" };
+            }
+
+            _logToFile = settings.LogToFile;
 
             // 2. Setup HttpClient
             var handler = new HttpClientHandler();
-            if (ignoreSsl)
+            if (settings.IgnoreSslErrors)
             {
                 handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
             }
 
             _httpClient = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(timeoutSeconds)
+                Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
             };
             _httpClient.DefaultRequestHeaders.Add("User-Agent", "IIS-KeepAlive-Worker/1.0");
 
             Log("=================================================");
             Log("  IIS Keep-Alive Service Started");
-            Log($"  Target URLs    : {string.Join(", ", urls)}");
-            Log($"  Interval       : Every {intervalMinutes} min");
-            Log($"  Mode           : {(runOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
-            Log($"  Ignore SSL     : {ignoreSsl}");
+            Log($"  Target URLs    : {string.Join(", ", settings.Urls)}");
+            Log($"  Interval       : Every {settings.IntervalMinutes} min");
+            Log($"  Mode           : {(settings.RunOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
+            Log($"  Ignore SSL     : {settings.IgnoreSslErrors}");
             Log("=================================================");
 
             // 3. Execution loop
             do
             {
-                foreach (var url in urls)
+                foreach (var url in settings.Urls)
                 {
                     await PingUrlAsync(url);
                 }
 
-                if (runOnce)
+                if (settings.RunOnce)
                 {
                     Log("RunOnce is enabled. Exiting.");
                     break;
                 }
 
-                Log($"Next check in {intervalMinutes} minutes... (Press Ctrl+C to stop)");
-                await Task.Delay(TimeSpan.FromMinutes(intervalMinutes));
+                Log($"Next check in {settings.IntervalMinutes} minutes... (Press Ctrl+C to stop)");
+                await Task.Delay(TimeSpan.FromMinutes(settings.IntervalMinutes));
 
-            } while (!runOnce);
+            } while (!settings.RunOnce);
         }
 
         private static async Task PingUrlAsync(string url)
@@ -128,7 +154,7 @@ namespace IisKeepAlive
             }
             catch
             {
-                // Silently ignore disk write errors
+                // Ignore disk write errors
             }
         }
     }
