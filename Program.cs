@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -13,11 +14,21 @@ namespace IisKeepAlive
         public SettingsConfig Settings { get; set; } = new();
     }
 
+    public class TargetRequestConfig
+    {
+        public string Url { get; set; } = string.Empty;
+        public string Method { get; set; } = "GET";
+        public Dictionary<string, string>? Headers { get; set; }
+        public string? Body { get; set; }
+        public string? ContentType { get; set; } = "application/json";
+    }
+
     public class SettingsConfig
     {
-        public List<string> Urls { get; set; } = new() { "http://localhost" };
-        public int IntervalMinutes { get; set; } = 60;
-        public int TimeoutSeconds { get; set; } = 30;
+        public List<string>? Urls { get; set; }
+        public List<TargetRequestConfig>? Targets { get; set; }
+        public int IntervalMinutes { get; set; } = 15;
+        public int TimeoutSeconds { get; set; } = 90;
         public bool RunOnce { get; set; } = false;
         public bool IgnoreSslErrors { get; set; } = true;
         public bool LogToFile { get; set; } = true;
@@ -58,10 +69,28 @@ namespace IisKeepAlive
                 }
             }
 
+            // Prepare targets: Targets take precedence, otherwise fallback to Urls
+            var targetsToRun = new List<TargetRequestConfig>();
+
+            if (settings.Targets != null && settings.Targets.Count > 0)
+            {
+                targetsToRun.AddRange(settings.Targets.Where(t => !string.IsNullOrWhiteSpace(t.Url)));
+            }
+            else if (settings.Urls != null && settings.Urls.Count > 0)
+            {
+                foreach (var url in settings.Urls.Where(u => !string.IsNullOrWhiteSpace(u)))
+                {
+                    targetsToRun.Add(new TargetRequestConfig { Url = url, Method = "GET" });
+                }
+            }
+
             // CLI arguments override
             if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
-                settings.Urls = new List<string> { args[0] };
+                targetsToRun = new List<TargetRequestConfig>
+                {
+                    new TargetRequestConfig { Url = args[0], Method = "GET" }
+                };
             }
 
             if (args.Length > 1 && int.TryParse(args[1], out int argInterval))
@@ -69,9 +98,9 @@ namespace IisKeepAlive
                 settings.IntervalMinutes = argInterval;
             }
 
-            if (settings.Urls == null || settings.Urls.Count == 0)
+            if (targetsToRun.Count == 0)
             {
-                settings.Urls = new List<string> { "http://localhost" };
+                targetsToRun.Add(new TargetRequestConfig { Url = "http://localhost", Method = "GET" });
             }
 
             _logToFile = settings.LogToFile;
@@ -91,8 +120,14 @@ namespace IisKeepAlive
 
             Log("=================================================");
             Log("  IIS Keep-Alive Service Started");
-            Log($"  Target URLs    : {string.Join(", ", settings.Urls)}");
+            Log($"  Target Count   : {targetsToRun.Count}");
+            foreach (var target in targetsToRun)
+            {
+                string method = string.IsNullOrWhiteSpace(target.Method) ? "GET" : target.Method.ToUpperInvariant();
+                Log($"  -> [{method}] {target.Url}");
+            }
             Log($"  Interval       : Every {settings.IntervalMinutes} min");
+            Log($"  Timeout        : {settings.TimeoutSeconds} sec");
             Log($"  Mode           : {(settings.RunOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
             Log($"  Ignore SSL     : {settings.IgnoreSslErrors}");
             Log("=================================================");
@@ -100,9 +135,9 @@ namespace IisKeepAlive
             // 3. Execution loop
             do
             {
-                foreach (var url in settings.Urls)
+                foreach (var target in targetsToRun)
                 {
-                    await PingUrlAsync(url);
+                    await PingTargetAsync(target);
                 }
 
                 if (settings.RunOnce)
@@ -117,21 +152,56 @@ namespace IisKeepAlive
             } while (!settings.RunOnce);
         }
 
-        private static async Task PingUrlAsync(string url)
+        private static async Task PingTargetAsync(TargetRequestConfig target)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            string method = string.IsNullOrWhiteSpace(target.Method) ? "GET" : target.Method.ToUpperInvariant();
             try
             {
-                Log($"[PING] Requesting: {url}");
-                using var response = await _httpClient!.GetAsync(url);
+                Log($"[PING] Requesting [{method}]: {target.Url}");
+                using var request = new HttpRequestMessage(new HttpMethod(method), target.Url);
+
+                if (target.Headers != null)
+                {
+                    foreach (var kvp in target.Headers)
+                    {
+                        if (string.Equals(kvp.Key, "Content-Type", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        request.Headers.TryAddWithoutValidation(kvp.Key, kvp.Value);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(target.Body) && (method == "POST" || method == "PUT" || method == "PATCH"))
+                {
+                    request.Content = new StringContent(target.Body, System.Text.Encoding.UTF8, target.ContentType ?? "application/json");
+                }
+
+                using var response = await _httpClient!.SendAsync(request);
                 sw.Stop();
 
-                Log($"[SUCCESS] Status: {(int)response.StatusCode} {response.StatusCode} | Time: {sw.ElapsedMilliseconds} ms");
+                int statusCode = (int)response.StatusCode;
+                if (statusCode >= 200 && statusCode < 400)
+                {
+                    Log($"[SUCCESS] Status: {statusCode} {response.StatusCode} | Time: {sw.ElapsedMilliseconds} ms");
+                }
+                else if (statusCode == 401 || statusCode == 403)
+                {
+                    Log($"[WARMED UP] Status: {statusCode} {response.StatusCode} | Time: {sw.ElapsedMilliseconds} ms (Authentication required, but WCF Service and AppPool are active)");
+                }
+                else
+                {
+                    Log($"[RESP] Status: {statusCode} {response.StatusCode} | Time: {sw.ElapsedMilliseconds} ms");
+                }
+            }
+            catch (TaskCanceledException ex) when (ex.CancellationToken == default)
+            {
+                sw.Stop();
+                Log($"[TIMEOUT] Request to {target.Url} timed out after {sw.ElapsedMilliseconds} ms. (Hint: Cold start compiling WCF or connecting DB can take 30-60s on first hit. Try increasing 'TimeoutSeconds' in appsettings.json)");
             }
             catch (Exception ex)
             {
                 sw.Stop();
-                Log($"[ERROR] Failed to reach {url} ({sw.ElapsedMilliseconds} ms): {ex.Message}");
+                Log($"[ERROR] Failed to reach {target.Url} ({sw.ElapsedMilliseconds} ms): {ex.Message}");
             }
         }
 
