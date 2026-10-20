@@ -43,113 +43,126 @@ namespace IisKeepAlive
         static async Task Main(string[] args)
         {
             Console.Title = "IIS Keep-Alive Service";
+            Console.WriteLine("[INFO] Starting IIS Keep-Alive Service...");
 
-            // 1. Load config from appsettings.json using built-in System.Text.Json
-            var settings = new SettingsConfig();
-            string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
-
-            if (File.Exists(configPath))
+            try
             {
-                try
-                {
-                    string json = await File.ReadAllTextAsync(configPath);
-                    var loaded = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    });
+                // 1. Load config from appsettings.json using built-in System.Text.Json
+                var settings = new SettingsConfig();
+                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
 
-                    if (loaded?.Settings != null)
+                if (File.Exists(configPath))
+                {
+                    try
                     {
-                        settings = loaded.Settings;
+                        string json = await File.ReadAllTextAsync(configPath);
+                        var loaded = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true
+                        });
+
+                        if (loaded?.Settings != null)
+                        {
+                            settings = loaded.Settings;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[WARN] Could not parse appsettings.json: {ex.Message}. Using default settings.");
                     }
                 }
-                catch (Exception ex)
+
+                // Prepare targets: Targets take precedence, otherwise fallback to Urls
+                var targetsToRun = new List<TargetRequestConfig>();
+
+                if (settings.Targets != null && settings.Targets.Count > 0)
                 {
-                    Log($"[WARN] Could not parse appsettings.json: {ex.Message}. Using default settings.");
+                    targetsToRun.AddRange(settings.Targets.Where(t => !string.IsNullOrWhiteSpace(t.Url)));
                 }
-            }
-
-            // Prepare targets: Targets take precedence, otherwise fallback to Urls
-            var targetsToRun = new List<TargetRequestConfig>();
-
-            if (settings.Targets != null && settings.Targets.Count > 0)
-            {
-                targetsToRun.AddRange(settings.Targets.Where(t => !string.IsNullOrWhiteSpace(t.Url)));
-            }
-            else if (settings.Urls != null && settings.Urls.Count > 0)
-            {
-                foreach (var url in settings.Urls.Where(u => !string.IsNullOrWhiteSpace(u)))
+                else if (settings.Urls != null && settings.Urls.Count > 0)
                 {
-                    targetsToRun.Add(new TargetRequestConfig { Url = url, Method = "GET" });
+                    foreach (var url in settings.Urls.Where(u => !string.IsNullOrWhiteSpace(u)))
+                    {
+                        targetsToRun.Add(new TargetRequestConfig { Url = url, Method = "GET" });
+                    }
                 }
-            }
 
-            // CLI arguments override
-            if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-            {
-                targetsToRun = new List<TargetRequestConfig>
+                // CLI arguments override
+                if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
                 {
-                    new TargetRequestConfig { Url = args[0], Method = "GET" }
+                    targetsToRun = new List<TargetRequestConfig>
+                    {
+                        new TargetRequestConfig { Url = args[0], Method = "GET" }
+                    };
+                }
+
+                if (args.Length > 1 && int.TryParse(args[1], out int argInterval))
+                {
+                    settings.IntervalMinutes = argInterval;
+                }
+
+                if (targetsToRun.Count == 0)
+                {
+                    targetsToRun.Add(new TargetRequestConfig { Url = "http://localhost", Method = "GET" });
+                }
+
+                _logToFile = settings.LogToFile;
+
+                // 2. Setup HttpClient
+                var handler = new HttpClientHandler();
+                if (settings.IgnoreSslErrors)
+                {
+                    handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+                }
+
+                _httpClient = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
                 };
-            }
+                _httpClient.DefaultRequestHeaders.Add("User-Agent", "IIS-KeepAlive-Worker/1.0");
 
-            if (args.Length > 1 && int.TryParse(args[1], out int argInterval))
-            {
-                settings.IntervalMinutes = argInterval;
-            }
-
-            if (targetsToRun.Count == 0)
-            {
-                targetsToRun.Add(new TargetRequestConfig { Url = "http://localhost", Method = "GET" });
-            }
-
-            _logToFile = settings.LogToFile;
-
-            // 2. Setup HttpClient
-            var handler = new HttpClientHandler();
-            if (settings.IgnoreSslErrors)
-            {
-                handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
-            }
-
-            _httpClient = new HttpClient(handler)
-            {
-                Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
-            };
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", "IIS-KeepAlive-Worker/1.0");
-
-            Log("=================================================");
-            Log("  IIS Keep-Alive Service Started");
-            Log($"  Target Count   : {targetsToRun.Count}");
-            foreach (var target in targetsToRun)
-            {
-                string method = string.IsNullOrWhiteSpace(target.Method) ? "GET" : target.Method.ToUpperInvariant();
-                Log($"  -> [{method}] {target.Url}");
-            }
-            Log($"  Interval       : Every {settings.IntervalMinutes} min");
-            Log($"  Timeout        : {settings.TimeoutSeconds} sec");
-            Log($"  Mode           : {(settings.RunOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
-            Log($"  Ignore SSL     : {settings.IgnoreSslErrors}");
-            Log("=================================================");
-
-            // 3. Execution loop
-            do
-            {
+                Log("=================================================");
+                Log("  IIS Keep-Alive Service Started");
+                Log($"  Target Count   : {targetsToRun.Count}");
                 foreach (var target in targetsToRun)
                 {
-                    await PingTargetAsync(target);
+                    string method = string.IsNullOrWhiteSpace(target.Method) ? "GET" : target.Method.ToUpperInvariant();
+                    Log($"  -> [{method}] {target.Url}");
                 }
+                Log($"  Interval       : Every {settings.IntervalMinutes} min");
+                Log($"  Timeout        : {settings.TimeoutSeconds} sec");
+                Log($"  Mode           : {(settings.RunOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
+                Log($"  Ignore SSL     : {settings.IgnoreSslErrors}");
+                Log("=================================================");
 
-                if (settings.RunOnce)
+                // 3. Execution loop
+                do
                 {
-                    Log("RunOnce is enabled. Exiting.");
-                    break;
-                }
+                    foreach (var target in targetsToRun)
+                    {
+                        await PingTargetAsync(target);
+                    }
 
-                Log($"Next check in {settings.IntervalMinutes} minutes... (Press Ctrl+C to stop)");
-                await Task.Delay(TimeSpan.FromMinutes(settings.IntervalMinutes));
+                    if (settings.RunOnce)
+                    {
+                        Log("RunOnce is enabled. Exiting.");
+                        break;
+                    }
 
-            } while (!settings.RunOnce);
+                    Log($"Next check in {settings.IntervalMinutes} minutes... (Press Ctrl+C to stop)");
+                    await Task.Delay(TimeSpan.FromMinutes(settings.IntervalMinutes));
+
+                } while (!settings.RunOnce);
+            }
+            catch (Exception fatal)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[FATAL ERROR] An unexpected error occurred: {fatal.Message}");
+                Console.WriteLine(fatal.ToString());
+                Console.ResetColor();
+                Console.WriteLine("\nPress Enter to exit...");
+                Console.ReadLine();
+            }
         }
 
         private static async Task PingTargetAsync(TargetRequestConfig target)
