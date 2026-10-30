@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -27,6 +29,15 @@ namespace IisKeepAlive
     {
         public List<string>? Urls { get; set; }
         public List<TargetRequestConfig>? Targets { get; set; }
+
+        /// <summary>
+        /// Local clock times to fire, e.g. ["06:59", "18:59"].
+        /// Accepts one string ("06:59" or "06:59,18:59") or an array.
+        /// When set, IntervalMinutes is not used.
+        /// </summary>
+        [JsonConverter(typeof(ScheduleTimesJsonConverter))]
+        public List<string>? ScheduleTimes { get; set; }
+
         public int IntervalMinutes { get; set; } = 15;
         public int TimeoutSeconds { get; set; } = 90;
         public bool RunOnce { get; set; } = false;
@@ -107,6 +118,7 @@ namespace IisKeepAlive
                 }
 
                 _logToFile = settings.LogToFile;
+                var schedule = ParseScheduleTimes(settings.ScheduleTimes);
 
                 // 2. Setup HttpClient
                 var handler = new HttpClientHandler();
@@ -129,30 +141,67 @@ namespace IisKeepAlive
                     string method = string.IsNullOrWhiteSpace(target.Method) ? "GET" : target.Method.ToUpperInvariant();
                     Log($"  -> [{method}] {target.Url}");
                 }
-                Log($"  Interval       : Every {settings.IntervalMinutes} min");
+                if (schedule.Count > 0)
+                {
+                    Log($"  Schedule      : {string.Join(", ", schedule.Select(t => t.ToString("HH:mm")))} (local time)");
+                    Log("  Interval       : ignored while ScheduleTimes is set");
+                }
+                else
+                {
+                    Log($"  Interval       : Every {settings.IntervalMinutes} min");
+                }
                 Log($"  Timeout        : {settings.TimeoutSeconds} sec");
                 Log($"  Mode           : {(settings.RunOnce ? "Single Ping (RunOnce)" : "Continuous Loop")}");
                 Log($"  Ignore SSL     : {settings.IgnoreSslErrors}");
                 Log("=================================================");
 
                 // 3. Execution loop
-                do
+                if (schedule.Count > 0)
                 {
-                    foreach (var target in targetsToRun)
+                    DateTime? lastFiredSlot = null;
+                    do
                     {
-                        await PingTargetAsync(target);
-                    }
+                        var slot = ResolveNextSlot(schedule, DateTime.Now, lastFiredSlot);
+                        if (slot.RunAt > DateTime.Now)
+                        {
+                            Log($"Next run at {slot.RunAt:yyyy-MM-dd HH:mm:ss} (local time). Press Ctrl+C to stop.");
+                            await WaitUntilAsync(slot.RunAt);
+                        }
 
-                    if (settings.RunOnce)
+                        foreach (var target in targetsToRun)
+                        {
+                            await PingTargetAsync(target);
+                        }
+
+                        lastFiredSlot = slot.ScheduledAt;
+
+                        if (settings.RunOnce)
+                        {
+                            Log("RunOnce is enabled. Exiting.");
+                            break;
+                        }
+                    } while (!settings.RunOnce);
+                }
+                else
+                {
+                    do
                     {
-                        Log("RunOnce is enabled. Exiting.");
-                        break;
-                    }
+                        foreach (var target in targetsToRun)
+                        {
+                            await PingTargetAsync(target);
+                        }
 
-                    Log($"Next check in {settings.IntervalMinutes} minutes... (Press Ctrl+C to stop)");
-                    await Task.Delay(TimeSpan.FromMinutes(settings.IntervalMinutes));
+                        if (settings.RunOnce)
+                        {
+                            Log("RunOnce is enabled. Exiting.");
+                            break;
+                        }
 
-                } while (!settings.RunOnce);
+                        Log($"Next check in {settings.IntervalMinutes} minutes... (Press Ctrl+C to stop)");
+                        await Task.Delay(TimeSpan.FromMinutes(settings.IntervalMinutes));
+
+                    } while (!settings.RunOnce);
+                }
             }
             catch (Exception fatal)
             {
@@ -162,6 +211,75 @@ namespace IisKeepAlive
                 Console.ResetColor();
                 Console.WriteLine("\nPress Enter to exit...");
                 Console.ReadLine();
+            }
+        }
+
+        private readonly record struct ScheduleSlot(DateTime ScheduledAt, DateTime RunAt);
+
+        private static List<TimeOnly> ParseScheduleTimes(IEnumerable<string>? rawTimes)
+        {
+            var result = new List<TimeOnly>();
+            if (rawTimes == null)
+                return result;
+
+            foreach (var raw in rawTimes)
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                    continue;
+
+                var text = raw.Trim().Replace('.', ':');
+                if (TimeOnly.TryParseExact(
+                        text,
+                        new[] { "H:mm", "HH:mm", "H:mm:ss", "HH:mm:ss" },
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out var time))
+                {
+                    result.Add(time);
+                }
+                else
+                {
+                    Log($"[WARN] Skip invalid ScheduleTimes value '{raw}'. Use HH:mm such as 06:59.");
+                }
+            }
+
+            return result.Distinct().OrderBy(t => t).ToList();
+        }
+
+        private static ScheduleSlot ResolveNextSlot(IReadOnlyList<TimeOnly> times, DateTime now, DateTime? lastFiredSlot)
+        {
+            for (var dayOffset = 0; dayOffset <= 8; dayOffset++)
+            {
+                var day = DateOnly.FromDateTime(now).AddDays(dayOffset);
+                foreach (var time in times)
+                {
+                    var scheduledAt = day.ToDateTime(time);
+                    if (lastFiredSlot.HasValue && scheduledAt <= lastFiredSlot.Value)
+                        continue;
+                    if (now >= scheduledAt.AddMinutes(1))
+                        continue;
+
+                    var runAt = scheduledAt > now ? scheduledAt : now;
+                    return new ScheduleSlot(scheduledAt, runAt);
+                }
+            }
+
+            var fallback = DateOnly.FromDateTime(now).AddDays(1).ToDateTime(times[0]);
+            return new ScheduleSlot(fallback, fallback);
+        }
+
+        private static async Task WaitUntilAsync(DateTime target)
+        {
+            while (DateTime.Now < target)
+            {
+                var remaining = target - DateTime.Now;
+                if (remaining <= TimeSpan.Zero)
+                    return;
+
+                var slice = remaining > TimeSpan.FromSeconds(15)
+                    ? TimeSpan.FromSeconds(15)
+                    : remaining;
+                await Task.Delay(slice);
             }
         }
 
@@ -239,6 +357,54 @@ namespace IisKeepAlive
             {
                 // Ignore disk write errors
             }
+        }
+    }
+
+    internal sealed class ScheduleTimesJsonConverter : JsonConverter<List<string>?>
+    {
+        public override List<string>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Null)
+                return null;
+
+            if (reader.TokenType == JsonTokenType.String)
+            {
+                var value = reader.GetString();
+                if (string.IsNullOrWhiteSpace(value))
+                    return new List<string>();
+
+                return value
+                    .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToList();
+            }
+
+            if (reader.TokenType != JsonTokenType.StartArray)
+                throw new JsonException("ScheduleTimes must be a time string or an array of time strings.");
+
+            var list = new List<string>();
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+            {
+                if (reader.TokenType == JsonTokenType.String)
+                    list.Add(reader.GetString() ?? string.Empty);
+                else
+                    throw new JsonException("ScheduleTimes array items must be strings.");
+            }
+
+            return list;
+        }
+
+        public override void Write(Utf8JsonWriter writer, List<string>? value, JsonSerializerOptions options)
+        {
+            if (value == null)
+            {
+                writer.WriteNullValue();
+                return;
+            }
+
+            writer.WriteStartArray();
+            foreach (var item in value)
+                writer.WriteStringValue(item);
+            writer.WriteEndArray();
         }
     }
 }

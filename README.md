@@ -35,6 +35,7 @@
         }
       }
     ],
+    "ScheduleTimes": [],
     "IntervalMinutes": 15,
     "TimeoutSeconds": 90,
     "RunOnce": false,
@@ -44,7 +45,38 @@
 }
 ```
 
-### 2. แบบยิง Method ที่ต้องส่ง POST + JSON Body
+`ScheduleTimes` ว่าง = ยิงถี่ตาม `IntervalMinutes` เหมือนเดิม
+
+### 2. แบบตั้งนาฬิกายิงตามเวลา (local time ของเครื่อง Server)
+
+ใส่เวลาที่ต้องการ โปรแกรมจะรอถึงเวลานั้นแล้วค่อยยิง ไม่ยิงทันทีตอนเปิดโปรแกรม  
+ถ้ารีสตาร์ทตอนอยู่ในนาทีนั้นพอดี (เช่นเปิดตอน 06:59:20) จะยิงหนึ่งครั้งแล้วรอรอบถัดไป
+
+```json
+{
+  "Settings": {
+    "Targets": [
+      {
+        "Url": "http://127.0.0.1:8002/ProductRESTService.svc/EnquireTambonLike",
+        "Method": "POST",
+        "ContentType": "application/json",
+        "Body": "{\"param\":{\"Top\":\"50\"}}"
+      }
+    ],
+    "ScheduleTimes": ["06:59", "12:59", "18:59"],
+    "IntervalMinutes": 15,
+    "TimeoutSeconds": 90,
+    "RunOnce": false,
+    "IgnoreSslErrors": true,
+    "LogToFile": true
+  }
+}
+```
+
+รูปแบบที่รับได้: `"06:59"`, `"6:59"`, `"06.59"` หรือหลายเวลาในสตริงเดียว `"06:59,18:59"`  
+เมื่อ `ScheduleTimes` มีค่า ระบบจะไม่ใช้ `IntervalMinutes`
+
+### 3. แบบยิง Method ที่ต้องส่ง POST + JSON Body
 ```json
 {
   "Settings": {
@@ -75,7 +107,8 @@
 > [!IMPORTANT]
 > **ค่า Default Idle Time-out ของ IIS คือ 20 นาที**  
 > หากตั้ง `IntervalMinutes` มากกว่า 20 นาที (เช่น 60 หรือ 120 นาที) ตัว IIS Application Pool จะหลับไปก่อนแล้ว ทำให้เกิด Cold Start ซ้ำอีก  
-> **แนะนำให้ตั้ง `IntervalMinutes` อยู่ที่ 10 - 15 นาที** เพื่อให้ Worker Process (`w3wp.exe`) ตื่นและคงแคชข้อมูลไว้ตลอดเวลา
+> **แนะนำให้ตั้ง `IntervalMinutes` อยู่ที่ 10 - 15 นาที** เพื่อให้ Worker Process (`w3wp.exe`) ตื่นและคงแคชข้อมูลไว้ตลอดเวลา  
+> `ScheduleTimes` ใช้เมื่อต้องการยิงตามนาฬิกา (เช่นอัปเดตแคช master data ตอน 06:59) ไม่ใช่การกัน App Pool หลับทั้งวัน ถ้าจุดประสงค์คือ keep-alive ให้ปล่อย `ScheduleTimes` ว่างแล้วใช้ `IntervalMinutes`
 
 ---
 
